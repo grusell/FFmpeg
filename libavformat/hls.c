@@ -2201,8 +2201,10 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
                     ts_diff = av_rescale_rnd(pls->pkt->dts, AV_TIME_BASE,
                                             tb.den, AV_ROUND_DOWN) -
                             pls->seek_timestamp;
-                    if (ts_diff >= 0 && (pls->seek_flags  & AVSEEK_FLAG_ANY ||
-                                        pls->pkt->flags & AV_PKT_FLAG_KEY)) {
+                    /* If AVSEEK_FLAG_ANY, keep reading until ts_diff is greater than 0
+                     * otherwise return the first keyframe encountered */
+                    if ((ts_diff >= 0 && (pls->seek_flags & AVSEEK_FLAG_ANY)) ||
+                        (!(pls->seek_flags & AVSEEK_FLAG_ANY) && (pls->pkt->flags & AV_PKT_FLAG_KEY)))  {
                         pls->seek_timestamp = AV_NOPTS_VALUE;
                         break;
                     }
@@ -2288,14 +2290,35 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
     return AVERROR_EOF;
 }
 
-static int hls_read_seek(AVFormatContext *s, int stream_index,
-                               int64_t timestamp, int flags)
+
+void hls_playlist_reset_reading(struct playlist *pls);
+
+void hls_playlist_reset_reading(struct playlist *pls) {
+  ff_format_io_close(pls->parent, &pls->input);
+  pls->input_read_done = 0;
+  ff_format_io_close(pls->parent, &pls->input_next);
+  pls->input_next_requested = 0;
+  av_packet_unref(pls->pkt);
+  pls->pb.eof_reached = 0;
+  /* Clear any buffered data */
+  pls->pb.buf_end = pls->pb.buf_ptr = pls->pb.buffer;
+  /* Reset the pos, to let the mpegts demuxer know we've seeked. */
+  pls->pb.pos = 0;
+  /* Flush the packet queue of the subdemuxer. */
+  ff_read_frame_flush(pls->ctx);
+}
+
+
+static int hls_read_seek2(AVFormatContext *s, int stream_index,
+                          int64_t min_ts, int64_t ts, int64_t max_ts, int flags)
 {
     HLSContext *c = s->priv_data;
     struct playlist *seek_pls = NULL;
     int i, j;
     int stream_subdemuxer_index;
+    int64_t timestamp = ts;
     int64_t first_timestamp, seek_timestamp, duration;
+    int64_t keyframe_before_ts = INT64_MIN, keyframe_after_ts = INT64_MAX;
     int64_t seq_no;
 
     if ((flags & AVSEEK_FLAG_BYTE) || (c->ctx->ctx_flags & AVFMTCTX_UNSEEKABLE))
@@ -2335,28 +2358,77 @@ static int hls_read_seek(AVFormatContext *s, int stream_index,
     seek_pls->cur_seq_no = seq_no;
     seek_pls->seek_stream_index = stream_subdemuxer_index;
 
+    /* Unless AVSEEK_FLAG_ANY,  Search for keyframe within min_ts, max_ts */
+    if (!(flags & AVSEEK_FLAG_ANY)) {
+
+      hls_playlist_reset_reading(seek_pls);
+
+      while (1) {
+        int ret;
+        int64_t pkt_dts;
+        ret = av_read_frame(seek_pls->ctx, seek_pls->pkt);
+        if (ret < 0) {
+          if (!avio_feof(&seek_pls->pb) && ret != AVERROR_EOF)
+            return ret;
+          break;
+        }
+        pkt_dts = seek_pls->pkt->dts;
+        av_packet_unref(seek_pls->pkt);
+        if (pkt_dts == AV_NOPTS_VALUE) {
+          seek_pls->seek_timestamp = AV_NOPTS_VALUE;
+          break;
+        }
+        if (pkt_dts < min_ts) {
+          continue;
+        }
+        if (pkt_dts > max_ts) {
+          break;
+        }
+        if (keyframe_before_ts > INT64_MIN &&
+            pkt_dts - ts > ts - keyframe_before_ts) {
+          break;
+        }
+        if (seek_pls->pkt->flags & AV_PKT_FLAG_KEY) {
+          if (pkt_dts <= ts) {
+            keyframe_before_ts = pkt_dts;
+          } else {
+            keyframe_after_ts = pkt_dts;
+            break;
+          }
+        }
+      }
+
+      if (keyframe_before_ts > INT64_MIN &&
+          (keyframe_after_ts == INT64_MAX ||
+           ts - keyframe_before_ts <= keyframe_after_ts - ts)) {
+        seek_timestamp = av_rescale_rnd(keyframe_before_ts, AV_TIME_BASE,
+                                        s->streams[stream_index]->time_base.den,
+                                        flags & AVSEEK_FLAG_BACKWARD ?
+                                        AV_ROUND_DOWN : AV_ROUND_UP);
+
+      } else if (keyframe_after_ts < INT64_MAX) {
+        seek_timestamp = av_rescale_rnd(keyframe_after_ts, AV_TIME_BASE,
+                                        s->streams[stream_index]->time_base.den,
+                                        flags & AVSEEK_FLAG_BACKWARD ?
+                                        AV_ROUND_DOWN : AV_ROUND_UP);
+      } else {
+        /* No keyframe found in given interval */
+        return AVERROR(ERANGE)
+      }
+    }
+
     for (i = 0; i < c->n_playlists; i++) {
         /* Reset reading */
         struct playlist *pls = c->playlists[i];
-        ff_format_io_close(pls->parent, &pls->input);
-        pls->input_read_done = 0;
-        ff_format_io_close(pls->parent, &pls->input_next);
-        pls->input_next_requested = 0;
-        av_packet_unref(pls->pkt);
-        pls->pb.eof_reached = 0;
-        /* Clear any buffered data */
-        pls->pb.buf_end = pls->pb.buf_ptr = pls->pb.buffer;
-        /* Reset the pos, to let the mpegts demuxer know we've seeked. */
-        pls->pb.pos = 0;
-        /* Flush the packet queue of the subdemuxer. */
-        ff_read_frame_flush(pls->ctx);
+        hls_playlist_reset_reading(pls);
 
         pls->seek_timestamp = seek_timestamp;
         pls->seek_flags = flags;
 
+        /* set closest segment seq_no for playlist */
+        find_timestamp_in_playlist(c, pls, seek_timestamp, &pls->cur_seq_no);
+
         if (pls != seek_pls) {
-            /* set closest segment seq_no for playlists not handled above */
-            find_timestamp_in_playlist(c, pls, seek_timestamp, &pls->cur_seq_no);
             /* seek the playlist to the given position without taking
              * keyframes into account since this playlist does not have the
              * specified stream where we should look for the keyframes */
@@ -2423,5 +2495,5 @@ const AVInputFormat ff_hls_demuxer = {
     .read_header    = hls_read_header,
     .read_packet    = hls_read_packet,
     .read_close     = hls_close,
-    .read_seek      = hls_read_seek,
+    .read_seek2      = hls_read_seek2,
 };
