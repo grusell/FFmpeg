@@ -8651,16 +8651,17 @@ static int mov_read_packet(AVFormatContext *s, AVPacket *pkt)
 
         for (i = 0; i < s->nb_streams; i++) {
             AVStream *avst = s->streams[i];
+            FFStream *ffst = ffstream(avst);
             MOVStreamContext *msc = avst->priv_data;
 
             // Clear current sample
             mov_current_sample_set(msc, 0);
 
             // Discard current index entries
-            if (avst->index_entries_allocated_size > 0) {
-                av_freep(&avst->index_entries);
-                avst->index_entries_allocated_size = 0;
-                avst->nb_index_entries = 0;
+            if (ffst->index_entries_allocated_size > 0) {
+                av_freep(&ffst->index_entries);
+                ffst->index_entries_allocated_size = 0;
+                ffst->nb_index_entries = 0;
             }
         }
 
